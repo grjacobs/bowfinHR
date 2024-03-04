@@ -1,0 +1,2 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<metadata xml:lang="en"><Esri><CreaDate>20220317</CreaDate><CreaTime>15250300</CreaTime><ArcGISFormat>1.0</ArcGISFormat><SyncOnce>TRUE</SyncOnce><DataProperties><lineage><Process ToolSource="c:\program files (x86)\arcgis\desktop10.7\ArcToolbox\Toolboxes\Conversion Tools.tbx\RasterToPolygon" Date="20220317" Time="152503">RasterToPolygon lrwindicator C:\Users\gj93\Box\Bowfin_telemetry\spatial\OneidaLake\lrw_poly.shp NO_SIMPLIFY VALUE SINGLE_OUTER_PART #</Process></lineage></DataProperties></Esri></metadata>
