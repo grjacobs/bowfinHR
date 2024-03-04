@@ -1,0 +1,1286 @@
+---
+title: "Bowfin Migration and Home Range Analysis - Change Points"
+author: "Greg Jacobs"
+date: "21 FEB 2024"
+output:
+  html_document: default
+---
+
+```{r setup, include=FALSE} 
+# Run this chunk after debugging
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r preliminaries, message=FALSE, warning=FALSE}
+set.seed(2) # R-side repeatability (need to set JAGS RNG seed separately)
+library(tidyverse)
+library(tidybayes)
+library(ggplot2)
+library(ggExtra)
+library(kableExtra)
+library(tidyr)
+library(readxl)
+library(lubridate)
+library(sf)
+library(raster)
+library(amt)
+library(purrr)
+library(runjags)
+select<-dplyr::select 
+crs_utm18n <- "EPSG:26918" # UTM zone 18N, https://epsg.io/32618
+# fish metadata recorded after tagging and release
+fishids <- read_excel("BowfinInventory_gj.xls") %>% 
+  mutate(id=as.character(FishID)) %>% 
+  filter(is.na(Omit)) #filter out dead fish
+#Load pre-conditioned telemetry data. 
+dat1 <- read_csv("bowfin_data.csv") %>% 
+  right_join(fishids) %>% #right join to carry through dead fish filter
+  mutate(Sex=factor(Sex), Year=factor(Year), ReleaseSite=factor(ReleaseSite),
+         Zdoy=scale(.$endDOY)[,1])
+# extract all point location fish observations
+# projected in CRS: NAD83 / UTM zone 18N
+fishobs <- dat1 %>% 
+  select(FishID, Year, DOY=endDOY, DateTime, Latitude, Longitude) %>% 
+  st_as_sf(coords = c("Longitude", "Latitude"), crs=4326) %>% 
+  st_transform(crs=crs_utm18n)
+# sf object of initial capture locations for each fish
+caploc <- fishids %>%
+  mutate(x=if_else(ReleaseSite=="Bradburys", -76.11321, -75.92999),
+         y=if_else(ReleaseSite=="Bradburys", 43.25366, 43.17359)) %>%
+  st_as_sf(coords=c("x", "y"), crs=4326) %>%
+  st_transform(crs=crs_utm18n) %>%
+  mutate(Year=year(ReleaseDate), DOY=yday(ReleaseDate),
+         DateTime=ReleaseDate) %>%
+  select(FishID, Year, DOY, DateTime) 
+# sf formatted point for Bradburys, projected in UTM 18N 
+bigbayloc <- st_drop_geometry(caploc) %>% 
+  mutate(DOY=1, x=-76.11321, y=43.25366) %>% 
+  st_as_sf(coords=c("x", "y"), crs=4326) %>% st_transform(crs=crs_utm18n)
+
+# add initial capture location for NSD reference location (comment out to omit)
+# fishobs <-  rbind(caploc, fishobs)
+
+# define NSD reference location as Big Bay (comment out to omit)
+fishobs <- rbind(bigbayloc, fishobs)
+```
+
+```{r tidy-relocations}
+dat <- left_join(fishobs, fishids) %>%
+  mutate(x_=st_coordinates(.)[,1]/1000, y_=st_coordinates(.)[,2]/1000,
+         t_=DateTime) %>% 
+  st_drop_geometry() %>% as_tibble() %>%
+  select(x_, y_, t_, sex=Sex, tl=TLmm, kg=Wkg, id=FishID, rel=ReleaseSite, 
+         t_rel=ReleaseDate, surgeon=Surgeon, year=Year) 
+dat0 <- make_track(dat, x_, y_, t_, id, sex, tl, kg, rel, crs=crs_utm18n) %>%
+  nest(data =c(x_, y_, t_))
+```
+
+Supporting spatial data
+
+```{r spatial-datasets}
+# Oneida Lake boundary from NHD v2.1
+olb <- sf::st_read(dsn="supporting", layer="OneidaLake_utm18n") 
+lrw <- raster("supporting/lrwindicator")
+lrw_df <- as.data.frame(lrw*!is.na(lrw), xy=TRUE) %>% 
+  mutate(value=ifelse(layer==1, 1, NA))
+```
+
+Run Bayesian change-point analysis.
+
+```{r migration-stationarity}
+library(mcp)
+# helper objects/dimensions
+pview <- c(407400.0, 4777456.9, 427398.1, 4789913.8 )
+maxNSD <- max(dist(dat[,c("x_", "y_")]))^2
+#data sets
+# meta data for each fish
+mcp_meta <- lapply(dat0$id, function(x) { filter(dat0, id==x) }) 
+  names(mcp_meta)<-dat0$id
+# telemetry object from package `amt`
+mcp_telem <- lapply(mcp_meta, function(a) as_telemetry(a$data[[1]])) 
+  #If interested, check out the semivariograms
+  #fit_svf <- lapply(mcp_telem, ctmm::variogram)
+  #p4 <- ggplotify::as.ggplot(~plot(fit_svf, level=c(0.5,0.95)))
+# spatial track data in sf POINTS format, converted back to meters UTM
+mcp_sf1 <- lapply(mcp_meta, function(a) {
+  a$data[[1]] %>% mutate(nsd=nsd(.), year=factor(year(t_)), 
+                         doy=yday(t_), dec.year=decimal_date(t_),
+                         x_=x_*1000, y_=y_*1000) %>% 
+    filter(doy>1) %>%  #exclude dummy initial location prior to analysis
+    as_sf_points() 
+  })
+# spatial track data in sf LINES format, converted back to meters UTM
+mcp_sf_lines <- lapply(mcp_meta, function(a) {
+  a$data[[1]] %>% mutate(nsd=nsd(.), year=factor(year(t_)), 
+                         doy=yday(t_), dec.year=decimal_date(t_),
+                         x_=x_*1000, y_=y_*1000) %>% 
+    filter(doy>1) %>% #exclude dummy initial location prior to analysis
+    as_sf_lines()   
+})
+#get rid of origin only "tracks" (when origin included, run anyway, no change)
+mcp_sf <- mcp_sf1[which(sapply(mcp_sf1, nrow)>1)]
+#Concatenate mcp_sf to one data table
+dat_sf <- bind_rows (mcp_sf, .id="id") %>%
+  dplyr::mutate(x_km = sf::st_coordinates(.)[,1]/1000,
+                y_km = sf::st_coordinates(.)[,2]/1000,
+                id=as.numeric(id)) %>% 
+  left_join(fishids, by=join_by(id==FishID))
+
+```
+
+Function to initialize chains. This links the JAGS RNG to the seed set in R, for repeatability.
+
+```{r}
+	inits0 <- function(chains=1){ 
+		inits.out <- list()
+		for (c in 1:chains){
+			inits.i <- list()
+			inits.i$.RNG.name = "base::Wichmann-Hill"
+			inits.i$.RNG.seed = runif(1, 1, 1e3)
+			inits.out[[c]] <- inits.i
+		}
+		return(inits.out)
+	}	
+```
+
+
+```{r migration-stationarity-functions}
+adapt=200000
+iter=50000
+set.seed(2)
+system.time(
+  mcp_models <- lapply(1:length(mcp_sf), function(i) {
+  #mcp_models <- lapply(1:1, function(i) { #
+    x <- mcp_sf[[i]]
+    print(paste(i, " out of ", length(mcp_sf), "; ", Sys.time(), sep=""))
+    n <- nrow(x)
+    e <- simpleError("Fail")
+    # Fit four models: null and 3 cp models
+    # null model: 1 mean, 1 variance
+    fit0 <- tryCatch(
+        mcp(model=list(nsd~1), 
+            prior=list(int_1="dnorm(0, 1000) T(0,)"),
+            inits=inits0(chains=3),
+            data=x, par_x="dec.year", adapt=adapt, iter=iter),
+        error=function(e) e)
+    # 1 location, 2 variances, 1 change point
+    fit1 <- tryCatch(
+        mcp(model=list(nsd~1,
+                       (1|year)~1 + sigma(1)),
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)",
+                       cp_1_sd="dnorm(0, 20) T(0,)",
+                       int_2="int_1"),
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+    # 2 locations, 2 variances, 1 change point
+    fit2 <- tryCatch(
+        mcp(model=list(nsd~1, 
+                       (1|year)~1 + sigma(1)),
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       int_2="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)", 
+                       cp_1_sd="dnorm(0, 20) T(0,)"),
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+    fitlist <- list(fit0=fit0, fit1=fit1, fit2=fit2)
+    if (nrow(x)>=12){ #the smallest that should work on our data sets 
+      # 3 locations, 3 variances, and 2 change points
+      fit3 <- tryCatch(
+        mcp(model=list(nsd~1,
+                       (1|year)~1 + sigma(1),
+                       (1|year)~1), 
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       int_2="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)",
+                       cp_2="dnorm(250, 20) T(200, 365)",
+                       cp_1_sd="dnorm(0, 20) T(0,)", 
+                       cp_2_sd="dnorm(0, 20) T(0,)", 
+                       int_3="int_1"), 
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+      fitlist$fit3 <- fit3
+    }
+    return(fitlist)
+  })
+)
+```
+
+
+```{r to-rerun}
+rerunfun <- function(x, adapt=100000, iter=10000){
+    n <- nrow(x)
+    e <- simpleError("Fail")
+    # Fit four models: null and 3 cp models
+    # null model: 1 mean, 1 variance
+    fit0 <- tryCatch(
+        mcp(model=list(nsd~1),  
+            prior=list(int_1="dnorm(0, 1000) T(0,)"), 
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter),
+        error=function(e) e)
+    # 1 location, 2 variances, 1 change point
+    fit1 <- tryCatch(
+        mcp(model=list(nsd~1,
+                       (1|year)~1 + sigma(1)),
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)",
+                       cp_1_sd="dnorm(0, 20) T(0,)",
+                       int_2="int_1"), 
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+    # 2 locations, 2 variances, 1 change point
+    fit2 <- tryCatch(
+        mcp(model=list(nsd~1, 
+                       (1|year)~1 + sigma(1)),
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       int_2="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)", 
+                       cp_1_sd="dnorm(0, 20) T(0,)"), 
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+    fitlist <- list(fit0=fit0, fit1=fit1, fit2=fit2)
+    if (nrow(x)>=12){ #the smallest that'll work on our data sets
+      # 3 locations, 3 variances, 2 change points
+      fit3 <- tryCatch(
+        mcp(model=list(nsd~1,
+                       (1|year)~1 + sigma(1),
+                       (1|year)~1), 
+            prior=list(int_1="dnorm(0, 1000) T(0,)",
+                       int_2="dnorm(0, 1000) T(0,)",
+                       cp_1="dnorm(180, 20) T(0, 200)",
+                       cp_2="dnorm(250, 20) T(200, 365)",
+                       cp_1_sd="dnorm(0, 20) T(0,)", 
+                       cp_2_sd="dnorm(0, 20) T(0,)", 
+                       int_3="int_1"),  
+            inits=inits0(chains=3),
+            data=x, par_x="doy", adapt=adapt, iter=iter, sample="both"),
+        error=function(e) e)
+      fitlist$fit3 <- fit3
+    }
+    return(fitlist)
+}
+```
+
+Now the labor-intensive process of going through each fish individually to (1) select the change point model that best supports the data, and (b) classify tracks as migratory (or not), and (3) classify points as either spring, summer, or non-migratory
+
+```{r checkingplotfunction}
+migplots <- function(sf.list=mcp_sf, i=1, mod=top){
+  name <- paste(names(mcp_sf)[[i]])
+  sex <- filter(fishids, FishID==as.numeric(names(mcp_sf)[[i]])) %>% pull(Sex)
+  tl <- filter(fishids, FishID==as.numeric(names(mcp_sf)[[i]])) %>% pull(TLmm)
+  p1 <- mcp_sf[[i]] %>%
+    ggplot() + 
+    ggtitle(paste(name, sex, tl)) + 
+    geom_tile(data=filter(lrw_df, !is.na(value)), aes(x=x, y=y), 
+              fill='gray90') +
+	  geom_sf(data=olb, color="light blue", fill=NA) +
+    geom_sf(data=mcp_sf_lines[[i]], color='gray70') +
+    geom_sf(data=slice(mcp_sf[[i]], which(t_==max(t_)|t_==min(t_))), 
+            color=c("green", "red"), size=5) + 
+    geom_sf(aes(color=doy, group=year)) + 
+    scale_color_viridis_c(name="DOY") +
+    theme_void() + 
+    coord_sf(xlim=pview[c(1,3)], ylim=pview[c(2,4)]) 
+  p2 <- mcp_sf[[i]] %>%
+    ggplot(aes(x=t_, y=nsd, color=factor(year(t_)))) +
+    geom_vline(xintercept=as.POSIXct(c("2009-01-01 00:00:00", 
+                                       "2010-01-01 00:00:00",
+                                       "2011-01-01 00:00:00",
+                                       "2012-01-01 00:00:00")),
+               lty=2, color="dark gray") +
+    geom_point() + geom_line() +
+    scale_color_discrete(name="Year") + 
+    coord_cartesian(xlim=as.POSIXct(c("2009-01-01 00:00:00", 
+                                      "2012-01-01 00:00:00"))) +
+    ylab("Net Squared Displacement (meters)") + xlab("Time") +
+    theme_classic() +
+    theme(legend.position="top", axis.title.y=element_blank())
+  p2marg <- ggMarginal(p2, type="histogram", margin="y")
+  p3 <- plot_pars(mod, type="dens_overlay", ncol=5)
+  p4 <- pp_check(mod, type="loo_ribbon", nsamples=9000)
+  plotlist <- list(p1, p2marg, p3, p4)
+  plotout <- ggpubr::ggarrange(plotlist=plotlist)
+  return(plotout)
+}
+```
+
+Create a function to check which MCP model performed the best and display results
+
+```{r checkfun-function}
+topfun <- function(i){
+  fname <- names(mcp_sf)[i]
+  x <- mcp_models[[i]]
+  # check convergence, omit those not converged 
+  maxRhat=sapply(x, function(x) fixef(x) %>% pull(Rhat) %>% max())
+  converged <- which(maxRhat<1.1)
+  # Compare models based on Pareto smoothed importance sampling in the `loo` 
+  # package (Vehtari et al. 2017, 2019)
+  if (length(converged)>1){
+    loo <- lapply(x[converged], loo::loo)
+    loo_compare <- loo::loo_compare(loo)
+    # top converged model
+    topname <- rownames(loo_compare)[1]
+    top <- x[[topname]]
+    mcp_topmod_name[[i]] <- topname
+    return(list(name=fname, maxRhat=maxRhat, loo_compare=loo_compare, 
+                topname=topname, top=top))
+  } else {
+    return(list(name=fname, maxRhat=maxRhat, loo_compare=NA,
+                topname=names(converged), top=x[[names(converged)]]))
+  }
+}
+checkfun <- function(i, top){
+  migplots(sf.list=mcp_sf, i=i, mod=top)
+}
+```
+
+Create functions to extract season change dates from 1-cp and 2-cp MCP models
+
+```{r}
+dates_1cp <- function(posteriors=mcp_models[[i]]$fit3$mcmc_post){
+    spread_draws(posteriors, cp_1, cp_1_year[year]) %>% 
+    summarize_all(median) %>% 
+    mutate(id=paste(names(mcp_sf)[[i]]),
+           year=paste(year),
+           cp_1=as_datetime(paste(year, round(cp_1 + cp_1_year, 0)), 
+                            format="%Y %j")) %>% 
+    select(id, year, cp_1 ) 
+}
+dates_2cp <- function(posteriors=mcp_models[[i]]$fit3$mcmc_post){
+    spread_draws(posteriors, cp_1, cp_2, cp_1_year[year], cp_2_year[year]) %>% 
+    summarize_all(median) %>% 
+    mutate(id=paste(names(mcp_sf)[[i]]),
+           year=paste(year),
+           cp_1=as_datetime(paste(year, round(cp_1 + cp_1_year, 0)), 
+                            format="%Y %j"),
+           cp_2=as_datetime(paste(year, round(cp_2 + cp_2_year, 0)), 
+                            format="%Y %j")) %>% 
+    select(id, year, cp_1, cp_2) 
+}
+```
+
+Include a function to plot results of best model
+
+```{r}
+p2fun <- function(i, topname=mcp_modsel[[i]]){
+  name <- paste(names(mcp_sf)[[i]])
+  sex <- filter(fishids, FishID==as.numeric(names(mcp_sf)[[i]])) %>% pull(Sex)
+  tl <- filter(fishids, FishID==as.numeric(names(mcp_sf)[[i]])) %>% pull(TLmm)
+  p1 <- mcp_sf[[i]] %>%
+    ggplot() + 
+    ggtitle(paste(name, sex, tl)) + 
+    geom_tile(data=filter(lrw_df, !is.na(value)), aes(x=x, y=y), 
+              fill='gray90') +
+	  geom_sf(data=olb, color="light blue", fill=NA) +
+    geom_sf(data=mcp_sf_lines[[i]], color='gray70') +
+    geom_sf(data=slice(mcp_sf[[i]], which(t_==max(t_)|t_==min(t_))), 
+            color=c("green", "red"), size=5) + 
+    geom_sf(aes(color=doy, group=year)) + 
+    scale_color_viridis_c(name="DOY") +
+    theme_void() + 
+    coord_sf(xlim=pview[c(1,3)], ylim=pview[c(2,4)]) 
+  p2 <- mcp_sf2[[i]] %>%
+    ggplot(aes(x=t_, y=nsd)) +
+    geom_vline(xintercept=as.POSIXct(c("2009-01-01 00:00:00", 
+                                       "2010-01-01 00:00:00",
+                                       "2011-01-01 00:00:00",
+                                       "2012-01-01 00:00:00")),
+               lty=2, color="dark gray") +
+    geom_line(aes(group=factor(year(t_)))) +
+    geom_point(aes(fill=factor(season)), color="grey50", shape=21, size=3) + 
+    scale_fill_grey(name="Season", na.value="white") +
+    #scale_color_discrete(name="Year") + 
+    coord_cartesian(xlim=as.POSIXct(c("2009-01-01 00:00:00", 
+                                      "2012-01-01 00:00:00"))) +
+    ylab("Net Squared Displacement (meters)") + xlab("Time") +
+    theme_classic() +
+    theme(legend.position="none", axis.title.y=element_blank())
+  p2marg <- ggMarginal(p2, type="histogram", margin="y")
+  patchwork::plot_layout(p1 + p2marg + 
+    patchwork::plot_annotation(caption=topname))
+   #ggpubr::ggarrange(plotlist=list(p1, p2marg))
+}
+```
+
+Some list objects to hold resutls
+
+```{r}
+mcp_sf2 <- list()
+mcp_modsel <- list()
+mcp_topmod <- list()
+mcp_topmod_name <- list()
+mcp_plot <- list()
+```
+
+\newpage
+
+### Fish ID: 12
+
+```{r check1}
+i=1
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+
+```{r dates1, fig.height=2, fig.width=6, warning=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+
+
+\newpage
+
+# Fish ID 14
+
+```{r check2, echo=FALSE}
+i=2
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+
+```{r dates2, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+# Fish ID 15
+
+```{r check3, echo=FALSE}
+i=3
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates3, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+ mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                           dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#   mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 16
+
+This one doesn't work out of the box due to convergence issues. Run again with more iterations to see if longer chains allow convergence.
+
+```{r check4, echo=FALSE}
+i=4
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates4, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                        dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+# mutate(season=1*(t_>cp_1))
+                        dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>%
+ mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 19
+
+```{r check5, echo=FALSE}
+i=5
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates5, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage 
+
+# Fish ID 20
+
+```{r check6, echo=FALSE}
+i=6
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates6, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+#(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+(p2 <- p2fun(i, topname="fit0"))
+```
+Note: the stationary model was equivalent to migration models by cross validation analyis.
+
+\newpage
+
+# Fish ID 21
+
+```{r check7, echo=FALSE}
+i=7
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates7, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 22
+
+```{r check8, echo=FALSE}
+i=8
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates8, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                        dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 23
+
+```{r check9, echo=FALSE}
+i=9
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+
+```{r dates9, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                        dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+#(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+(p2 <- p2fun(i, topname="fit0"))
+```
+Note: there is actually no seasonal pattern observed here, just two outliers in the third year. Classification based on CP interval result in all spring locations in 2009 and 2010, and all summer locations in 2011. this is not plausible given the spread in dates. Classify this one as stationary. 
+
+\newpage
+
+# Fish ID 25
+
+```{r check10, echo=FALSE}
+i=10
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates10, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 26
+
+```{r check11, echo=FALSE}
+i=11
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates11, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 27
+
+```{r check12, echo=FALSE}
+i=12
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates12, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 28
+
+```{r check13, echo=FALSE}
+i=13
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates13, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 29
+
+```{r check14, echo=FALSE}
+i=14
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+This looks like a stationary home range with occasional non-repeated forays, but the single change point model for NSD variance performed the best. 
+
+```{r dates14, echo=FALSE, fig.height=3, fig.width=6, warning=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                         dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>%
+ mutate(season=1*(t_>cp_1))
+#                         dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+# mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 30
+
+```{r check15, echo=FALSE}
+i=15
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates15, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 13
+
+```{r check16, echo=FALSE}
+i=16
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates16, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+   #                         dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+   # mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>%
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 17
+
+```{r check17, echo=FALSE}
+i=17
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates17, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 18
+
+```{r check18, echo=FALSE}
+i=18
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates18, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 34
+
+```{r check19, echo=FALSE}
+i=19
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates19, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+
+\newpage
+
+# Fish ID 38
+
+```{r check20, echo=FALSE}
+i=20
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates20, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 36
+
+```{r check21, echo=FALSE}
+i=21
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+
+```{r dates21, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 37
+
+```{r check22, echo=FALSE}
+i=22
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates22, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 38
+
+```{r check23, echo=FALSE}
+i=23
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates23, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 39
+
+```{r check24, echo=FALSE}
+i=24
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates24, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 40
+
+```{r check25, echo=FALSE}
+i=25
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates25, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 41
+
+```{r check26, echo=FALSE}
+i=26
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates26, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 42
+
+```{r check27, echo=FALSE}
+i=27
+(mcp_modsel[[i]] <- topfun(i=i)) 
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r check27-rerun}
+i=27
+#only one model (the null) converged, but change points seem obvious
+sapply(mcp_models[[i]], function(x) fixef(x) %>% pull(Rhat) %>% max())
+# first observation in 2009 seems inconsistent with rest of data\
+# omit first year (single observation) and rerun
+mcp_models[[i]] <- rerunfun(x=mcp_sf[[i]] %>% filter(year(t_)>2009), 
+                            adapt=200000, 
+                            iter=50000)
+```
+
+```{r check27-2, echo=FALSE}
+i=27
+(mcp_modsel[[i]] <- topfun(i=i)) 
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates27, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1),
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)),
+         id=names(mcp_sf)[i]) #make sure omitted point retains its id
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 43
+
+```{r check28, echo=FALSE}
+i=28
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates28, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+This fish was manually classified as "stationary" due to lack of fit. The CPM did not distinguish the change points that are evident to the naked eye in 2010, classifying all observations in this year as "summer", likely an artifact related to the lack of migration in 2011.
+
+\newpage
+
+# Fish ID 44
+
+```{r check29, echo=FALSE}
+i=29
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates29, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+ mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#  left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 46
+
+```{r check30, echo=FALSE}
+i=30
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates30, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+#mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 47
+
+```{r check31, echo=FALSE}
+i=31
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+Only the null model converged for this one, so use it. 
+
+```{r dates31, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 49
+
+```{r check32, echo=FALSE}
+i=32
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates32, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+# mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 50
+
+```{r check33, echo=FALSE}
+i=33
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates33, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 32
+
+```{r check34, echo=FALSE}
+i=34
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+ 
+
+```{r dates34, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+ mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+#left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 45
+
+```{r check35, echo=FALSE}
+i=35
+(mcp_modsel[[i]] <- topfun(i=i))
+mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+
+```{r dates35, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+# mcp_sf2[[i]] <- mcp_sf[[i]] %>% mutate(id=paste(names(mcp_sf)[[i]]), season=99)
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=1*(t_>cp_1))
+#                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+\newpage
+
+# Fish ID 48
+
+```{r check36, echo=FALSE}
+i=36
+(mcp_modsel[[i]] <- topfun(i=i))
+#mcp_topmod[[i]] <- mcp_modsel[[i]]$top
+mcp_topmod[[i]] <- mcp_models[[i]]$fit3
+(mcp_plot[[i]] <- checkfun(i=i, mcp_topmod[[i]]))
+paste("n =", nrow(mcp_sf[[i]]))
+```
+
+```{r dates36, fig.height=3, fig.width=6, warning=FALSE, echo=FALSE}
+mcp_sf2[[i]] <- left_join(mcp_sf[[i]],
+#                          dates_1cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+#  mutate(season=1*(t_>cp_1))
+                          dates_2cp(posteriors=mcp_topmod[[i]]$mcmc_post)) %>% 
+  mutate(season=ifelse(t_>cp_2, NA, 1*(t_>cp_1)))
+names(mcp_sf2)[i] <- names(mcp_sf)[i]
+(p2 <- p2fun(i, topname=mcp_modsel[[i]]$topname))
+```
+
+
+# Collating season classifications
+
+Collate and save the results for further home range analysis. 
+
+```{r export}
+mcp_sf2_tab <- bind_rows(mcp_sf2)
+names(mcp_topmod) <- names(mcp_sf)
+save(mcp_sf2_tab, mcp_sf2, mcp_topmod, file="mcp_out.RData")
+```
+
+
+```{r sessionInfo}
+testjags()
+sessionInfo()
+```
+
+

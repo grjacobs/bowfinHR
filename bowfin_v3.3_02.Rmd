@@ -1,0 +1,1039 @@
+---
+title: "Bowfin Migration and Home Range Analysis"
+author: "Greg Jacobs"
+date: "21 FEB 2024"
+output:
+  html_document:
+    toc: yes
+    theme: united
+---
+
+```{r preliminaries, message=FALSE, warning=FALSE}
+t0 <- Sys.time()
+set.seed(2) # make workflow repeatable
+library(tidyverse)
+library(ggplot2)
+library(ggExtra)
+library(ggpubr)
+library(kableExtra)
+library(tidyr)
+library(readxl)
+library(lubridate)
+library(sf)
+library(raster)
+library(amt)
+library(purrr)
+library(runjags)
+library(patchwork)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(DHARMa)
+select<-dplyr::select
+crs_utm18n <- "EPSG:26918" # UTM zone 18N, https://epsg.io/32618
+lu <- function(x) length(unique(x)) # a helper function to save space
+# fish metadata recorded after tagging and release
+fishids <- read_excel("BowfinInventory_gj.xls") %>% 
+  mutate(id=as.character(FishID))
+# fish observation data
+fishobs_tab <- read_csv("bowfin_data.csv") %>% 
+  left_join(fishids) %>% 
+  filter(!is.na(Latitude)) %>% # filter out missing coordinates
+  mutate(DOY=yday(DateTime)) %>% # need DOY of all datetime observations
+  filter(!is.na(distday)&Distance>0) %>% # keep only observations of movement
+  mutate(Sex=factor(Sex), Year=factor(Year), ReleaseSite=factor(ReleaseSite),
+         Zdoy=scale(.$endDOY)[,1])
+fishobs <- fishobs_tab %>% filter(!is.na(Latitude)) %>% 
+  st_as_sf(coords=c("Longitude", "Latitude"), crs=4326) %>%
+  st_transform(crs=crs_utm18n)
+# Bayesian change-point models and results
+load(file="mcp_out.RData")
+# Bayesian change-point results summery table
+mcp_summary <- read_excel("MCPresultstab_20240303.xlsx") %>% 
+  select(-Notes) %>% 
+  left_join(fishids)
+# sf object of initial capture locations for each fish
+caploc <- fishids %>%
+  mutate(x=if_else(ReleaseSite=="Bradburys", -76.11321, -75.92999),
+         y=if_else(ReleaseSite=="Bradburys", 43.25366, 43.17359)) %>%
+  st_as_sf(coords=c("x", "y"), crs=4326) %>%
+  st_transform(crs=crs_utm18n) %>%
+  mutate(Year=year(ReleaseDate), DOY=yday(ReleaseDate)) %>%
+  select(FishID, Year, DOY) 
+```
+
+## Supporting spatial data
+
+Load spatial datasets and project everything into NAD83/UTM zone 18N. 
+
+```{r spatial-datasets}
+# Oneida Lake boundary from NHD v2.1
+olb <- sf::st_read(dsn="supporting", layer="OneidaLake_utm18n") 
+lrwpoly <- sf::st_read(dsn="supporting",
+                       layer="lrw_poly",
+                       crs=crs_utm18n) 
+bathy <- raster("supporting/depth_2")
+rw <- raster("supporting/rwindicator")
+lk <- raster("supporting/oneidaind")
+lrw <- raster("supporting/lrwindicator")
+# create data frames from rasters, clipped to lake shore, for plotting
+bathy_df <- as.data.frame(bathy*lk, xy=TRUE) 
+names(bathy_df)[3] <- "value"
+rw_df <- as.data.frame(rw*is.na(lk), xy=TRUE) %>% 
+  mutate(value=ifelse(layer==1, 1, NA))
+lrw_df <- as.data.frame(lrw*!is.na(lrw), xy=TRUE) %>% 
+  mutate(value=ifelse(layer==1, 1, NA))
+lrw_mask_df <- mutate(lrw_df, value=ifelse(is.na(value),1,NA))
+```
+
+Map locations across available habitats in Oneida Lake and surrounding wetland and stream habitats.
+
+```{r plotlocations, fig.height=3, fig.width=6}
+# plot locations by FishID - base plot for fig 1 and results figures
+plotlocations <- ggplot() + 
+  geom_tile(data=rw_df %>% filter(!is.na(value)), 
+            aes(x=x, y=y), fill='gray90', color='gray90') +
+  geom_tile(data=bathy_df %>% filter(!is.na(value)), 
+            aes(x=x, y=y, fill=value, color=value)) +
+  scale_fill_viridis_c(name='Depth (m)', direction=-1, end=0.6) +
+  scale_color_viridis_c(name='Depth (m)', direction=-1, end=0.6) +
+	geom_sf(data=fishobs, shape=3, alpha=0.5) +
+  geom_sf(data=caploc, shape=19, col="gold") +
+  coord_sf(xlim=c(408000, 440000), ylim=c(4773813, 4793563)) +
+	theme_void() + #theme(legend.position="none")+
+	ggspatial::annotation_north_arrow(which_north="true", pad_y=unit(0.25, "in"),
+		style = ggspatial::north_arrow_fancy_orienteering) +
+	ggspatial::annotation_scale(location = "bl", width_hint = 0.5) + 
+  theme(plot.title=element_text(hjust=0.5))
+```
+
+# Depth and Distance from shore. 
+
+Visualize and analyze sex differences. 
+
+```{r depth-dist-sex-summary}
+fishobs_tab %>% 
+  group_by(FishID, Sex) %>% 
+  summarize(ShoreDist_m=mean(ShoreDist_m, na.rm=TRUE),
+            Depth_m=mean(Depth_m, na.rm=TRUE)) %>% 
+  ungroup() %>% 
+  group_by(Sex) %>% 
+  summarize(mean_ShoreDist_m=mean(ShoreDist_m, na.rm=TRUE),
+            sd_ShoreDist_m=sd(ShoreDist_m, na.rm=TRUE),
+            n_ShoreDist_m=sum(!is.na(ShoreDist_m)),
+            mean_Depth_m=mean(Depth_m, na.rm=TRUE),
+            sd_Depth_m=sd(Depth_m, na.rm=TRUE),
+            n_Depth_m=sum(!is.na(Depth_m)))
+```
+
+Repeated measures analysis of depth by sex.
+
+```{r test-depth-sex}
+lmer(log(Depth_m) ~ Sex + (1|FishID), data=fishobs_tab) %>% 
+  summary(ddf="Satterthwaite")
+lmer(log(Depth_m) ~ Sex + (1|FishID), data=fishobs_tab) %>% 
+  anova(ddf="Satterthwaite")
+```
+
+Repeated measures analysis of distance from shore by sex. 
+
+```{r test-shoredist-sex}
+lmer(log(ShoreDist_m+1)  ~ Sex + (1|FishID), data=fishobs_tab) %>% 
+  summary(ddf="Satterthwaite")
+lmer(log(ShoreDist_m+1)  ~ Sex + (1|FishID), data=fishobs_tab) %>% 
+  anova(ddf="Satterthwaite")
+```
+
+```{r depth-dist-plot-fisholny, fig.width=6.5, fig.height=2}
+depthdistmvmntplot <- fishobs_tab %>% 
+  group_by(FishID, Sex) %>% 
+  summarize(barShoreDist=mean(ShoreDist_m+1, na.rm=TRUE),
+            barDepth_m=mean(Depth_m, na.rm=TRUE),
+            barDistDay=mean(distday, na.rm=TRUE))
+pShoreDist <- depthdistmvmntplot %>% 
+  ggplot(aes(barShoreDist, color=factor(Sex))) +
+  scale_color_grey() +
+  geom_density(size=1) +  
+  scale_x_log10() +
+  ylab("Density") +
+  xlab("Shore Distance (m)") + 
+  theme_classic() + theme(legend.position = "none")
+pDepth <- depthdistmvmntplot %>% 
+  ggplot(aes(barDepth_m, color=factor(Sex))) +
+  scale_color_grey() +
+  geom_density(size=1) + 
+  scale_x_log10() +
+  ylab("") +
+  xlab("Depth (m)") + 
+  theme_classic() + theme(legend.position = "none")
+pdistday <- depthdistmvmntplot %>% 
+  ggplot(aes(barDistDay, color=factor(Sex))) +
+  scale_color_grey() +
+  geom_density(size=1) + 
+  scale_x_log10(breaks=c(1,10,100,1000)) +
+  ylab("") +
+  xlab("Movement (m/day)") + 
+  theme_classic() + labs(color="Sex") 
+fig3 <- pShoreDist + pDepth + pdistday + 
+  plot_annotation(tag_levels=list(c("a)", "b)", "c)"))) +
+  plot_layout(widths=c(1,1,1), ncol=3, nrow=1)  
+ggsave("fig3_freq.png", fig3, width=6.5, height=2, units="in", dpi=600, 
+       bg="white")
+knitr::include_graphics("fig3_freq.png")
+```
+
+# Movement analysis
+
+Analysis of minimum distance moved per day by sex, year, and day of year.
+
+```{r MM-summary1}
+# population average and sd of individual average movement rate
+mMdat <- filter(fishobs_tab, dayssince<22)
+group_by(mMdat, FishID, Sex) %>% 
+  summarize(meandistday=mean(distday, na.rm=TRUE)) %>% 
+  group_by(Sex) %>% 
+  summarize(meanM=mean(meandistday),
+            sdM=sd(meandistday))
+```
+
+```{r MM-summary2}
+# population average of within-individual SD of movement rate
+mMdat <- filter(fishobs_tab, dayssince<22)
+group_by(mMdat, FishID, Sex) %>% 
+  summarize(sddistday=sd(distday, na.rm=TRUE)) %>% 
+  group_by(Sex) %>% 
+  summarize(meansdM=mean(sddistday, na.rm=TRUE))
+```
+
+```{r MM-linear-model-analysis}
+mM <- lmer(log(distday) ~ Sex*Year + Sex*Zdoy + (Zdoy|FishID), data=mMdat)
+```
+
+```{r MM-linear-model-anovaTable}
+anova(mM, ddf="Satterthwaite")
+```
+
+```{r MM-linear-model-plot}
+margMdf <- emmip(mM, ~ Sex|Year|Zdoy, lmer.df="satterthwaite", plotit=FALSE)
+pd <- position_dodge(.3)
+p <- ggplot(data=margMdf, aes(x=Year, y=exp(yvar), fill=Sex, Sroup=Sex)) +
+  geom_errorbar(aes(ymin=exp(yvar-SE), ymax=exp(yvar+SE)), 
+                color='black', width=.2, position=pd) +
+  geom_line(position=pd) +
+  geom_point(color='black', size=8, position=pd, shape=21) +
+  scale_fill_grey() +
+  ylab(expression("Movement "~(m/day))) +
+  theme_classic() 
+ggsave("fig4_Mmeans.png", p, width=6.5, height=4, units="in", dpi=600, 
+       bg="white")
+knitr::include_graphics("fig4_Mmeans.png")
+```
+
+```{r MM-table}
+tab_model(mM, df.method = "satterthwaite")
+```
+
+```{r MM-ta-test}
+simulationOutput <- simulateResiduals(fittedModel=mM, plot=FALSE)
+testTemporalAutocorrelation(simulationOutput, time=mMdat$datetime)
+```
+
+```{r MM-lrt}
+mMreduced <- lmer(log(distday) ~ Sex*Year + Sex*Zdoy + (1|FishID), data=mMdat)
+anova(mMreduced, mM)
+```
+
+
+# Change point models
+
+Change point model outputs are produced in a separate script, and summaries of their results are uploaded here for presentation and for use in the home range analysis.
+
+```{r}
+mcp_summary %>% arrange(Usedmod)
+```
+
+Reorganize fixed effect coefficients from change point models.
+
+```{r}
+# concatenate seasonal change points and filter out non-seasonal models
+mcp_fixefs <- lapply(1:length(mcp_topmod), function(x){
+  summary(mcp_topmod[[x]]$mcmc_post)$quantiles %>% data.frame() %>% 
+    rename(median=X50.) %>% 
+    mutate(name=row.names(.),
+           id=names(mcp_topmod[x])) %>% 
+    filter(!grepl("\\[", name))
+}) %>% bind_rows() 
+# extract random effects - median change point by year by fish
+mcp_cp1yr <- lapply(1:length(mcp_topmod), function(x){
+  summary(mcp_topmod[[x]]$mcmc_post)$quantiles %>% data.frame() %>% 
+    rename(median=X50.) %>% 
+    mutate(name=row.names(.),
+           id=names(mcp_topmod[x])) %>% 
+    separate("name", into=c("name", "year"), sep="\\[|\\]", extra="drop") %>% 
+    filter(name=="cp_1"|name=="cp_1_year") %>% 
+    select(id, name, year, median) %>% 
+    mutate(cp1day=median+pull(filter(., name=="cp_1"), median)) %>% 
+    filter(!is.na(year))
+}) %>% bind_rows() 
+```
+
+```{r meansd-fixef-cp-1}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"& class=="Migration") %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median), 
+            n=n())
+```
+
+How many fish with change point models supported, and do their change point dates differ by sex? The top models for some fish contained change point estimates but were rejected as still not supporting migratory behavior due to lack of fit. Because of this, we need `cp_1` parameters from fish tracks classified as "Migration". 
+
+```{r meansd-sex-fixef-cp-1}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"& class=="Migration") %>% 
+  group_by(Sex) %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median), 
+            n=n())
+```
+
+```{r test-fixef-cp-1}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"& class=="Migration") %>% 
+  {t.test(.$median ~ .$Sex, var.equal = FALSE)}
+```
+
+How many of these fish had two change points between (to and from) two intervals? We want to compare `cp_2`; just extracting that parameter is enough to filter to the target subset.
+
+```{r meansd-fixef-fit3}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_2") %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median),
+            n=n())
+```
+
+```{r meansd-sex-fixef-fit3}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_2") %>% 
+  group_by(Sex) %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median), 
+            n=n())
+```
+
+```{r test-fixef-fit3}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_2") %>% 
+  {t.test(.$median ~ .$Sex, var.equal = FALSE)}
+```
+
+How many of the "seasonal" fish tracks had variance-only changes points. We can look at this by extracting and summarizing the number of fish for which `Usedmod` equals 1. 
+
+```{r meansd-sex-fixef-fit1}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"&Usedmod==1) %>% 
+  group_by(Sex) %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median),
+            n=n())
+```
+
+Here are results for fish with single change point models.
+
+* Overall:
+
+```{r meansd-fixef-fit2}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"&Usedmod==2) %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median),
+            n=n())
+```
+
+* By sex:
+
+```{r meansd-sex-fixef-fit2}
+mcp_fixefs %>% left_join(mcp_summary) %>% 
+  filter(name=="cp_1"&Usedmod==2) %>% 
+  group_by(Sex) %>% 
+  summarize(mean=mean(median), sd=sd(median), min=min(median), max=max(median),
+            n=n())
+```
+
+## Seasons
+
+We delineated season using the change point analysis and used these delineations to classify fish locations. 
+
+```{r fig.width=4, fig.height=4}
+mcp_sf_lines <- lapply(mcp_sf2, function(x) {
+  summarize(x, do_union=FALSE) %>% st_cast("LINESTRING")
+  })
+pview <- c(407400.0, 4777456.9, 427398.1, 4789913.8 )
+p2fun <- function(i){
+  name <- paste(names(mcp_sf2)[[i]])
+  sex <- filter(fishids, FishID==as.numeric(names(mcp_sf2)[[i]])) %>% pull(Sex)
+  tl <- filter(fishids, FishID==as.numeric(names(mcp_sf2)[[i]])) %>% pull(TLmm)
+  p1 <- mcp_sf2[[i]] %>%
+    ggplot() + 
+    geom_tile(data=filter(lrw_df, !is.na(value)), aes(x=x, y=y), 
+              fill='gray90') +
+	  geom_sf(data=olb, color="light blue", fill=NA) +
+    geom_sf(data=mcp_sf_lines[[i]], color='gray70') +
+    geom_sf(data=slice(mcp_sf2[[i]], which(t_==max(t_)|t_==min(t_))), 
+            shape=c(1, 2), size=5) + 
+    geom_sf(aes(color=doy, group=year)) + 
+    scale_color_viridis_c(name="DOY") +
+    theme_void() + 
+    coord_sf(xlim=pview[c(1,3)], ylim=pview[c(2,4)]) 
+  p2 <- mcp_sf2[[i]]  %>% 
+    mutate(season = if (exists('season', where=.)) season else 5) %>% 
+    ggplot(aes(x=t_, y=nsd)) +
+    ggtitle("") + 
+    geom_vline(xintercept=as.POSIXct(c("2009-01-01 00:00:00", 
+                                       "2010-01-01 00:00:00",
+                                       "2011-01-01 00:00:00",
+                                       "2012-01-01 00:00:00")),
+               lty=2, color="dark gray") +
+    geom_line(aes(group=factor(year(t_)))) +
+    geom_point(aes(fill=factor(season)), color="grey50", shape=21, size=3) + 
+    scale_fill_grey(name="Season", na.value="white") +
+    #scale_color_discrete(name="Year") + 
+    ylim(0, 350) +
+    coord_cartesian(xlim=as.POSIXct(c("2009-01-01 00:00:00", 
+                                      "2012-01-01 00:00:00"))) +
+    ylab(expression(NSD~(km^2))) + xlab("Time") +
+    theme_classic() +
+    theme(legend.position="none")
+  p2marg <- ggMarginal(p2, type="histogram", margin="y")
+  p <- (p1+p2marg)
+  return(p)
+}
+p.seasonalM <- p2fun(12) #FishID #27 fit2, seasonal male
+p.seasonalF <- p2fun(23) #FishID #38 fit3, seasonal female
+p.seasonalVar <- p2fun(13) #FishID #28 fit1, var-seasonal female
+p.aseasonal <- p2fun(29) #FishID #44 Stationary male
+fig5 <- p.seasonalM[[1]] + p.seasonalM[[2]] +
+  p.seasonalF[[1]] + p.seasonalF[[2]] + 
+  p.seasonalVar[[1]] +  p.seasonalVar[[2]] +
+  p.aseasonal[[1]] +  p.aseasonal[[2]] + 
+  plot_layout(nrow=4, ncol=2) +
+  plot_annotation(tag_levels='a', tag_suffix = ')') 
+ggsave("fig5_pCPM.png", fig5, width=8, height=8, units="in", dpi=600, bg="white")
+knitr::include_graphics("fig5_pCPM.png")
+```
+
+```{r mean-change-point-distributions}
+pcpdist <- filter(mcp_fixefs, name=="cp_1") %>% left_join(fishids) %>% 
+  ggplot(aes(factor(Sex), median, color=TLmm)) + 
+  geom_violin(fill="white") + 
+  ylab("Change point (day of year)") +
+  xlab("Sex") + 
+  ggbeeswarm::geom_beeswarm(size=3) + 
+  scale_color_viridis_c() + theme_minimal() + labs(fill=c("P(DiffInt)"))
+pcpdist
+```
+
+
+Define separate tracks for separate seasons.
+
+```{r track-datasets}
+# all relocations
+dat_hr <- mcp_sf2_tab %>% left_join(fishids) %>% left_join(mcp_summary) %>% 
+  mutate(x_=st_coordinates(.)[,1], y_=st_coordinates(.)[,2]) %>% 
+  st_drop_geometry() %>% as_tibble() %>%
+  select(x_, y_, t_, sex=Sex, tl=TLmm, kg=Wkg, id, rel=ReleaseSite, 
+         t_rel=ReleaseDate, surgeon=Surgeon, year, season) 
+# all seasons
+dat_all <- select(dat_hr, -season) %>% 
+  make_track(x_, y_, t_, id, sex, tl, kg, rel, crs=crs_utm18n) %>% 
+  nest(data =c(x_, y_, t_))
+# spring & fall seasons separately
+dat_season <- filter(dat_hr, season%in%c(0,1)) %>% 
+  make_track(x_, y_, t_, id, sex, tl, kg, rel, season, crs=crs_utm18n) %>% 
+  nest(data =c(x_, y_, t_))
+```
+
+# Home Ranges
+
+Organize relocation data into tidy framework employed by package `amt`. To do so, condition into a movement track list - a tibble with one row per fish and a list data column containing relocations. Next, add a new list column that contains the home-range estimate for each animal. Estimate home ranges using 4 methods as Signer et al. (2015) did, truncating the dataset to only tracks with greater than 9 relocations.  
+
+```{r home-ranges}
+hrlevel <- 0.8
+# Home ranges for full relocation dataset
+hr_all <- dat_all %>%
+  mutate(n_relocs=map_dbl(data, ~nrow(.))) %>% filter(n_relocs>9) %>%
+  mutate(
+    hr_mcp = map(data, hr_mcp, levels=hrlevel),
+    hr_locoh = map(data, possibly(~ hr_locoh(., n=ceiling(sqrt(nrow(.))), 
+                                             levels=hrlevel), NULL)),
+    hr_kde = map(data, ~ hr_kde(., trast=make_trast(., factor=1.75), 
+                                levels=hrlevel)),
+    hr_akde = map(data, ~ hr_akde(., fit_ctmm(., "auto"), levels=hrlevel))
+  )
+#save(hr_all, file="hr_all.Rdata")
+cat(lu(hr_all$id), "fish with all-season home range estimates\n")
+# Home ranges for tracks split by MCP results
+hr_season <- dat_season %>%
+  mutate(n_relocs=map_dbl(data, ~nrow(.))) %>% filter(n_relocs>9) %>%
+  mutate(
+    hr_mcp = map(data, hr_mcp, levels=hrlevel),
+    hr_locoh = map(data, possibly(~ hr_locoh(., n=ceiling(sqrt(nrow(.))), 
+                                             levels=hrlevel), NULL)),
+    hr_kde = map(data, ~ hr_kde(., trast=make_trast(., factor=1.75), 
+                                levels=hrlevel)),
+    hr_akde = map(data, ~ hr_akde(., fit_ctmm(., "auto"), levels=hrlevel))
+  )
+#save(hr_season, file="hr_season.Rdata")
+cat(lu(hr_season$id), "fish with season-specific home range estimates\n")
+cat(filter(hr_season, season==0) %>% nrow(), "spring home range estimates\n")
+cat(filter(hr_season, season==1) %>% nrow(), "summer home range estimates\n")
+cat(group_by(hr_season, id) %>% summarize(n=n()) %>% 
+      filter(n==2) %>% nrow(), "with both seasons' home range estimates")
+```
+
+Home range models have now been fit and stored in table objects. Pivot to long format for analysis of home range sizes by estimator. 
+
+```{r home-range-areas, warning=FALSE}
+# pivot to long format
+hr_all_1 <- hr_all %>% select(-data) %>% 
+  pivot_longer(hr_mcp:hr_akde, names_to="estimator", values_to="hr")
+hr_season_1 <- hr_season %>% select(-data) %>% 
+  pivot_longer(hr_mcp:hr_akde, names_to="estimator", values_to="hr")
+# Functions to calculate areas (in square m)
+do_iso <- function(x) hr_isopleths(x) %>% filter(what=="estimate")
+clip_iso <- function(x) st_intersection(x, lrwpoly)
+# Calculate home range areas
+hr_all_1.area <- hr_all_1 %>%
+    mutate(hr_area=map(hr, possibly(hr_area, NULL)),
+         hr_isopleth=map(hr, possibly(do_iso, NULL)),
+         hr_isopleth_clp=map(hr_isopleth, possibly(clip_iso, NULL))
+         ) 
+hr_season_1.area <- hr_season_1%>% 
+  mutate(hr_area=map(hr, possibly(hr_area, NULL)),
+         hr_isopleth=map(hr, possibly(do_iso, NULL)),
+         hr_isopleth_clp=map(hr_isopleth, possibly(clip_iso, NULL))
+         )
+```
+
+
+## Map home ranges
+
+Use the home ranges from aKDE estimation for visualization. 
+
+```{r}
+all_akde <- hr_all_1.area %>%  filter(estimator=="hr_akde") %>% 
+  select(-hr_isopleth) %>% unnest(hr_isopleth_clp) %>% st_as_sf()
+sp_akde <- hr_season_1.area %>%  filter(season==0&estimator=="hr_akde") %>% 
+  select(-hr_isopleth) %>% unnest(hr_isopleth_clp) %>% st_as_sf()
+su_akde <- hr_season_1.area %>%  filter(season==1&estimator=="hr_akde") %>% 
+  select(-hr_isopleth) %>% unnest(hr_isopleth_clp) %>% st_as_sf()
+```
+
+```{r fig-hrs}
+#main plot
+plotlocations_f <- ggplot() + 
+  geom_tile(data=rw_df %>% filter(!is.na(value)), 
+            aes(x=x, y=y), fill='gray90', color='gray90') +
+  geom_tile(data=bathy_df %>% filter(!is.na(value)), 
+            aes(x=x, y=y, fill=value, color=value)) +
+  scale_fill_viridis_c(name='Depth (m)', direction=-1, end=0.6) +
+  scale_color_viridis_c(name='Depth (m)', direction=-1, end=0.6) +
+	theme_void()
+# lines for raw HRs
+sp_akde_unclip <- hr_season_1.area %>%  filter(season==0&estimator=="hr_akde") %>% 
+  select(-hr_isopleth_clp) %>% unnest(hr_isopleth) %>% st_as_sf() %>% 
+  arrange(-area)
+su_akde_unclip <- hr_season_1.area %>%  filter(season==1&estimator=="hr_akde") %>% 
+  select(-hr_isopleth_clp) %>% unnest(hr_isopleth) %>% st_as_sf() %>% 
+  arrange(-area)
+# plot fill for clipped but outlines for raw HRs
+p_sp_akde_f <- plotlocations_f +
+  ggtitle("Spring") +
+  geom_sf(data=sp_akde_unclip, alpha=0.2, fill="gold", color=NA) +
+  geom_sf(data=sp_akde_unclip, alpha=0.2, fill=NA, color="white") +
+  geom_tile(data=lrw_mask_df %>% filter(!is.na(value)), 
+            aes(x=x, y=y), fill="white", color="white") +
+  geom_sf(data=st_centroid(sp_akde_unclip), shape=3, color="gray20") +
+  coord_sf(xlim=st_bbox(olb)[c(1,3)], ylim=st_bbox(olb)[c(2,4)]) 
+p_su_akde_f <- plotlocations_f +
+  ggtitle("Summer") +
+  geom_sf(data=su_akde, alpha=0.2, fill="gold", color=NA) +
+  geom_sf(data=su_akde, alpha=0.2, fill=NA, color="white") +
+  geom_sf(data=st_centroid(su_akde_unclip), shape=3, color="gray20") +
+  coord_sf(xlim=st_bbox(olb)[c(1,3)], ylim=st_bbox(olb)[c(2,4)]) +
+	ggspatial::annotation_north_arrow(which_north="true", 
+	                                  pad_y = unit(0.635, "cm"),
+	                                  height = unit(1., "cm"),
+	                                  width = unit(1., "cm"),
+		style = ggspatial::north_arrow_fancy_orienteering) +
+	ggspatial::annotation_scale(location = "bl", width_hint = 0.5) 
+#build plot
+combined <- p_sp_akde_f / p_su_akde_f + plot_layout(guides="collect")
+ggsave("fig6_pHRS.png", combined, width=6.5, height=4.3, dpi=600, bg="white")
+knitr::include_graphics("fig6_pHRS.png")
+```
+
+## Plot home range sizes
+
+Plot home range size by estimator and sex for comparison. Home ranges are expressed in meters because that is the basic unit of the coordinate reference system, but here we convert to square km.
+
+### Aseasonal home range
+
+```{r home-range-nonmigr}
+# function to derive home range sizes
+fci <- function(hr.area){
+    hr.area1 <- hr.area %>% 
+    unnest(cols=hr_area) %>%
+    mutate(area = area / 1e6) 
+  hr.area1$est_lab<-factor(hr.area1$estimator, 
+                           levels=c("hr_mcp", "hr_locoh", "hr_kde", "hr_akde"), 
+                           labels=c("MCP", "LoCoH", "KDE", "aKDE"))
+  #remove list column in order to pivot wider and separate estimates from ci
+  hr.area2 <- hr.area1 %>% select(-hr) %>%
+    pivot_wider(names_from=what, values_from=area)
+  #calculate upper and lower confidence intervals on log scale
+  ci2 <- hr.area2 %>% group_by(est_lab, sex) %>% 
+    summarise(m = mean(log(estimate)), 
+              sd = sd(log(estimate)),
+              se = sd(log(estimate)) / sqrt(n()), 
+              me = qt(0.975, n() - 1) * se, 
+              lci = m - me, 
+              uci = m + me,
+              n=n())
+  return(list(hr.area=hr.area2, ci.area=ci2))
+}
+# function to plot home range sizes
+fplot.range <- function(hr.area, ci.area){
+  # gj edits to p1
+  p1.2 <- hr.area %>% 
+    ggplot(aes(est_lab, estimate, shape = sex)) + 
+    scale_shape_manual(values=c(2, 5)) +
+    geom_pointrange(aes(x = est_lab, y = estimate, ymin = `lci (0.95)`, 
+                        ymax = `uci (0.95)`, shape = sex), inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5)) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  p2.2 <- hr.area %>% 
+    ggplot(aes(est_lab, log(estimate), shape = sex)) + 
+    scale_shape_manual(values=c(2, 5)) +
+    geom_jitter(alpha = 0.5, position = position_dodge2(width = 0.5)) +
+    geom_pointrange(aes(x = est_lab, y = m, ymin = lci, ymax = uci, shape=sex), 
+                    data = ci.area, inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5),
+                    size=1) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  # need confidence interval of the log response ratio log(meanM/meanF)
+  # se(log(barm)-log(barf) = sqrt( s^2 /(n*barx)))
+  hr.logratio <- hr.area %>% 
+    nest(data=-c(est_lab, sex)) %>% 
+    mutate(barx=map_dbl(data, ~mean(log(.$estimate))), 
+           SD=map_dbl(data, ~sd(log(.$estimate))),
+           n=map_dbl(data, ~nrow(.)),
+           Sn=(SD^2)/n) %>%
+    nest(data=-est_lab) %>%
+    mutate(lr=map_dbl(data, ~ .$barx[.$sex=="M"] - .$barx[.$sex=="F"]),
+           SElr=map_dbl(data, ~ sqrt(.$Sn[.$sex=="M"] + .$Sn[.$sex=="F"])),
+           df=map_dbl(data, ~ .$n[.$sex=="M"]+.$n[.$sex=="F"]-2),
+           ucilr=lr+qt(0.975, df)*SElr,
+           lcilr=lr-qt(0.975, df)*SElr)
+  p3.2 <- hr.logratio %>% 
+    ggplot(aes(est_lab, lr)) + 
+    geom_pointrange(aes(ymin=lcilr, ymax=ucilr)) + 
+    geom_hline(yintercept = 0, lty = 2) +
+    theme_light() +
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(log(HRS[m]) - log(HRS[f])))
+  
+  (p1.2 / p2.2 / p3.2) + plot_layout(heights = c(0.5, 0.5, 0.5)) + 
+    plot_annotation(tag_levels = "A", tag_suffix = ")")
+}
+# Run function for non-seasonal home range areas
+(hr_all_out<- fci(hr_all_1.area))
+```
+
+### Spring home range
+
+```{r home-range-spring}
+# Run function for seasonal home range areas split by MCP intervals
+(hr_season_out_spring <- hr_season_1.area %>% filter(season==0) %>% fci())
+```
+
+### Fall home range
+
+```{r home-range-summer}
+# Run function for seasonal home range areas split by MCP intervals
+(hr_season_out_su <- hr_season_1.area %>% filter(season==1) %>% fci())
+```
+
+### HRs for appendix
+
+```{r hr-spring-summer-plot, fig.width=11, fig.height=6.5}
+  p1.1 <- hr_season_out_spring$hr.area %>% 
+    ggplot(aes(est_lab, estimate, shape = sex)) + 
+    scale_shape_manual(values=c(2, 5)) +
+    geom_pointrange(aes(x = est_lab, y = estimate, ymin = `lci (0.95)`, 
+                        ymax = `uci (0.95)`, shape = sex), inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5)) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  p1.2 <- hr_season_out_su$hr.area %>% 
+    ggplot(aes(est_lab, estimate, shape = sex)) +
+    scale_shape_manual(values=c(2, 5)) +
+    geom_pointrange(aes(x = est_lab, y = estimate, ymin = `lci (0.95)`, 
+                        ymax = `uci (0.95)`, shape = sex), inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5)) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  p2.1 <- hr_season_out_spring$hr.area %>% 
+    ggplot(aes(est_lab, log(estimate), shape = sex)) + 
+    scale_shape_manual(values=c(2, 5)) +
+    geom_jitter(alpha = 0.5, position = position_dodge2(width = 0.5)) +
+    geom_pointrange(aes(x = est_lab, y = m, ymin = lci, ymax = uci, shape=sex), 
+                    data = hr_season_out_spring$ci.area, inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5),
+                    size=1) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  p2.2 <- hr_season_out_su$hr.area %>% 
+    ggplot(aes(est_lab, log(estimate), shape = sex)) + 
+    scale_shape_manual(values=c(2, 5)) +
+    geom_jitter(alpha = 0.5, position = position_dodge2(width = 0.5)) +
+    geom_pointrange(aes(x = est_lab, y = m, ymin = lci, ymax = uci, shape=sex), 
+                    data = hr_season_out_su$ci.area, inherit.aes = FALSE, 
+                    position = position_dodge2(width = 0.5),
+                    size=1) +
+    theme_light() + 
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(paste("HRS [", km^2, "]")))
+  # need confidence interval of the log response ratio log(meanM/meanF)
+  # se(log(barm)-log(barf) = sqrt( s^2 /(n*barx)))
+  hr.logratio1 <- hr_season_out_spring$hr.area %>% 
+    nest(data=-c(est_lab, sex)) %>% 
+    mutate(barx=map_dbl(data, ~mean(log(.$estimate))), 
+           SD=map_dbl(data, ~sd(log(.$estimate))),
+           n=map_dbl(data, ~nrow(.)),
+           Sn=(SD^2)/n) %>%
+    nest(data=-est_lab) %>%
+    mutate(lr=map_dbl(data, ~ .$barx[.$sex=="M"] - .$barx[.$sex=="F"]),
+           SElr=map_dbl(data, ~ sqrt(.$Sn[.$sex=="M"] + .$Sn[.$sex=="F"])),
+           df=map_dbl(data, ~.$n[.$sex=="M"]+.$n[.$sex=="F"]-2),
+           ucilr=lr+qt(0.975, df)*SElr,
+           lcilr=lr-qt(0.975, df)*SElr)
+  hr.logratio2 <- hr_season_out_su$hr.area %>% 
+    nest(data=-c(est_lab, sex)) %>% 
+    mutate(barx=map_dbl(data, ~mean(log(.$estimate))), 
+           SD=map_dbl(data, ~sd(log(.$estimate))),
+           n=map_dbl(data, ~nrow(.)),
+           Sn=(SD^2)/n) %>%
+    nest(data=-est_lab) %>%
+    mutate(lr=map_dbl(data, ~ .$barx[.$sex=="M"] - .$barx[.$sex=="F"]),
+           SElr=map_dbl(data, ~ sqrt(.$Sn[.$sex=="M"] + .$Sn[.$sex=="F"])),
+           df=map_dbl(data, ~.$n[.$sex=="M"]+.$n[.$sex=="F"]-2),
+           ucilr=lr+qt(0.975, df)*SElr,
+           lcilr=lr-qt(0.975, df)*SElr)
+  p3.1 <- hr.logratio1 %>% 
+    ggplot(aes(est_lab, lr)) + 
+    geom_pointrange(aes(ymin=lcilr, ymax=ucilr)) + 
+    geom_hline(yintercept = 0, lty = 2) +
+    theme_light() +
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(log(HRS[m]) - log(HRS[f])))
+  p3.2 <- hr.logratio2 %>% 
+    ggplot(aes(est_lab, lr)) + 
+    geom_pointrange(aes(ymin=lcilr, ymax=ucilr)) + 
+    geom_hline(yintercept = 0, lty = 2) +
+    theme_light() +
+    theme(axis.title.x = element_blank()) +
+    labs(y = expression(log(HRS[m]) - log(HRS[f])))
+  # build plot
+  pspring <- (p1.1 + p2.1 + p3.1) + 
+    plot_layout(ncol=1)
+  psummer <- (p1.2 + p2.2 + p3.2) + 
+    plot_layout(ncol=1)
+  pcombo <- (pspring | psummer) + 
+    plot_layout(ncol=2) + 
+    plot_annotation(tag_levels = "A", tag_suffix = ")")
+ggsave("figS4_HRs.png", pcombo, width=9, height=5.3, units="in", dpi=600, 
+       bg="white")
+knitr::include_graphics("figS4_HRs.png")
+```
+
+### Aggregate and summarize HR estimates
+
+Create a table summarizing home range size esitmates by season, sex, and estimator
+
+```{r}
+(hr.summary.table <- bind_rows(mutate(hr_all_out$hr.area, season=99),
+                              hr_season_out_spring$hr.area, 
+                              hr_season_out_su$hr.area) %>% 
+  mutate(sex=factor(sex), 
+         season=factor(season),
+         estimator=factor(estimator)) %>% 
+  dplyr::select(season, id:level, est_lab, estimate) %>% 
+  group_by(sex, estimator, season) %>% 
+  summarise(m = mean(log(estimate)), 
+            sd = sd(log(estimate)),
+            se = sd(log(estimate)) / sqrt(n()), 
+            me = qt(0.975, n() - 1) * se, 
+            lci = m - me, 
+            uci = m + me,
+            n=n()) %>% 
+  mutate(hat_hr=exp(m), hat_lci=exp(lci), hat_uci=exp(uci)) %>% 
+  arrange(estimator, season, sex))
+```
+
+```{r}
+hr.summary.table %>% 
+  mutate(cell=paste0(round(hat_hr, 3), "(", 
+             round(hat_lci, 3), " - ", 
+             round(hat_uci, 3), ")")) %>% 
+  dplyr::select(sex, estimator, season, cell) %>% 
+  pivot_wider(names_from=c(season, sex), values_from=cell) %>% 
+  kableExtra::kable()
+```
+
+# Home range size analysis
+
+```{r A-linear-model-analysis}
+hr2.area.season <- bind_rows(hr_season_out_spring$hr.area, 
+                             hr_season_out_su$hr.area) %>% 
+  mutate(sex=factor(sex), 
+         season=factor(season),
+         estimator=factor(estimator)) %>% 
+  dplyr::select(id:level, est_lab, estimate)
+m.hr <- lmer(log(estimate) ~ sex*season + (1|est_lab), data=hr2.area.season)
+```
+
+```{r A-linear-model-anovaTable}
+anova(m.hr, ddf="Satterthwaite")
+```
+
+```{r A-marginal-means-plot}
+margdf <- emmip(m.hr, ~ sex|season, lmer.df="satterthwaite", plotit=FALSE)
+pd <- position_dodge(.3)
+p <- ggplot(data=margdf, aes(x=season, y=exp(yvar), fill=sex, group=sex)) +
+  geom_errorbar(aes(ymin=exp(yvar-SE), ymax=exp(yvar+SE)), 
+                color='black', width=.2, position=pd) +
+  geom_line(position=pd) +
+  geom_point(color='black', size=8, position=pd, shape=21) +
+  scale_fill_grey() +
+  ylab(expression("Home Range Size "~(km^2))) +
+  scale_y_log10() +
+  scale_x_discrete(labels=c("0"="Spring", "1"="Summer")) +
+  theme_classic() +
+  guides(shape=guide_legend(title="Sex")) + 
+  theme(axis.title=element_text(size = rel(1.5)),
+        axis.text=element_text(size = rel(1.5), color="black"),
+        legend.title=element_text(size = rel(1.3)),
+        legend.text=element_text(size = rel(1.3)),
+        axis.title.x=element_blank())
+ggsave("fig7_Ameans.png", p, width=6.5, height=4, units="in", dpi=600, 
+       bg="white")
+knitr::include_graphics("fig7_Ameans.png")
+```
+
+A tabular summary of regression model output for the appendix. 
+
+```{r A-linear-model-table}
+tab_model(m.hr, df.method="satterthwaite")
+```
+
+# Summer resorts
+
+First, establish a grid over which we may produce count summaries of relocations per fish per season per year. We specified a hexagonal-cell grid (area ~2.5 km per cell) over Oneida Lake and retained all cells in which any fish was observed during our study. Results of seasonal home range analysis suggested that a 2.5 km^2 grid cell could contain the average home range size in spring or summer for males or females. 
+
+```{r}
+# create hexagonal grid over Oneida Lake detection locations
+g <- hr_season %>% unnest(data) %>% 
+  mutate(year=year(t_), yearf=factor(year)) %>% 
+  dplyr::select(id, sex, season, year, yearf, x_:t_) %>% 
+  st_as_sf(coords=c(y="x_", x="y_"), remove=FALSE, crs=crs_utm18n) %>% 
+  st_make_grid(square=FALSE, n = c(10,10)) %>% st_sf() %>% 
+  filter(st_intersects(., summarize(fishobs) %>% st_cast("MULTIPOINT"), 
+                       sparse=FALSE) %>% as.vector()) %>% 
+  mutate(cell=1:nrow(.), area=st_area(.))
+```
+
+Starting from the data table `hr_season`, create a new table `hr_season_summerresort` that adds columns for data list cells subset by year (`data09`, `data10`, `data11`) and hr_mcp list cells by year (`hr_mcp09`, `hr_mcp10`, `hr_mcp11`). 
+
+```{r}
+hr_summerresort <- hr_season %>% 
+  mutate(data09=map(data, ~subset(., year(.$t_)==2009)),
+         n09=map_dbl(data09, ~nrow(.)),
+         hr_mcp09=ifelse(n09>2, map_dbl(data09, ~nrow(.), levels=1), NA),
+         data10=map(data, ~subset(., year(.$t_)==2010)),
+         n10=map_dbl(data10, ~nrow(.)),
+         hr_mcp10=ifelse(n10>2, map_dbl(data10, ~nrow(.), levels=1), NA),
+         data11=map(data, ~subset(., year(.$t_)==2011)),
+         n11=map_dbl(data11, ~nrow(.)),
+         hr_mcp11=ifelse(n11>2, map_dbl(data11, ~nrow(.), levels=1), NA),
+         datacell=map(data, 
+                      ~st_intersection(
+                        st_as_sf(., coords=c(y="x_", x="y_"), 
+                                 remove=FALSE, 
+                                 crs=crs_utm18n), 
+                        g)
+                      ),
+         cellct=map(datacell, 
+                    ~st_drop_geometry(.) %>%
+                      mutate(year=year(t_), 
+                             yearf=factor(year, 
+                                          levels=c("2009", "2010", "2011"))) %>% 
+                      group_by(year, yearf, cell) %>% 
+                      summarize(n=n()) %>% 
+                      ungroup()
+                    ),
+         cellp=map(cellct, 
+                   ~select(., -yearf) %>% 
+                     full_join(expand.grid(year=c(2009:2011),
+                                           cell=unique(.$cell)),
+                               by=join_by(year, cell)) %>%
+                     replace(is.na(.), 0) %>% 
+                     group_by(year) %>% 
+                     mutate(p=n/sum(n)) %>% ungroup() %>%
+                     pivot_wider(id_cols=cell,
+                                 names_from=year, 
+                                 values_from=p, 
+                                 names_prefix='p') %>% 
+                     mutate(srpq0910=sqrt(p2009*p2010),
+                            srpq1011=sqrt(p2011*p2010)) 
+                   ),
+         bc0910=map_dbl(cellp, ~summarize(., sum(srpq0910)) %>% pull()),
+         bc1011=map_dbl(cellp, ~summarize(., sum(srpq1011)) %>% pull())
+         ) %>% 
+  rowwise() %>% 
+  mutate(bcmean=mean(c(bc0910, bc1011), na.rm=TRUE))
+```
+
+Plot summer locations and cell distributions for individual fish. Ladies first.
+
+
+```{r fig.width=6, fig.height=6}
+scale_color_years <- function(...){
+    ggplot2:::manual_scale(
+        'color', 
+        values = setNames(c("#f98e09", "#57106e", "#000004"), 
+                          #c("2009", "2010", "2011")),
+                          c("2011", "2010", "2009")), 
+        ...
+    )
+}
+hr_summerresortM <- hr_summerresort %>% 
+  filter(sex=="M", season==1&!is.na(bcmean)) %>% arrange(-bcmean)
+psrlistM <- lapply(1:nrow(hr_summerresortM), function(i){
+  sra <- hr_summerresortM[i,] %>% 
+    unnest(data) %>% 
+    st_as_sf(coords=c("x_", "y_"), crs=crs_utm18n)
+  this <-  ggplot(sra) +
+    geom_text(aes(x=411000, y=4790200, label= 
+              paste0("ID = ", hr_summerresortM[i,"id"],
+                     ", BC = ", round(hr_summerresortM[i,"bcmean"], 2))),
+              size=2.5, hjust=0) +
+    geom_sf(data=g, fill=NA, color="grey90") +
+    geom_text(aes(x=408000, y=4782000), 
+             label=paste0("2009, n=", sum(year(sra$t_)==2009)),
+             size=2, hjust=0,  parse=FALSE, color="#000004") +
+    geom_text(aes(x=408000, y=4781000), 
+             label=paste0("2010, n=", sum(year(sra$t_)==2010)),
+             size=2, hjust=0,  parse=FALSE, color="#57106e") +
+    geom_text(aes(x=408000, y=4780000), 
+             label=paste0("2011, n=", sum(year(sra$t_)==2011)),
+             size=2, hjust=0,  parse=FALSE, color="#f98e09") +
+    geom_sf(data=olb, fill=NA, color="grey50") +
+    geom_sf(aes(color=factor(year(t_))), shape=3, size=3, alpha=1) + 
+    scale_color_years(name="Year") +
+    coord_sf(xlim=st_bbox(g)[c(1,3)], ylim=st_bbox(g)[c(2,4)]) +
+    theme_void() + 
+    theme(plot.margin=unit(c(0,0,0,0), "cm"),
+          plot.title=element_text(size=10)) + 
+    theme(legend.position="none")
+  return(this)
+})
+for (x in 1:(length(psrlistM)-1)){
+psrlistM[[x]] <- psrlistM[[x]] + 
+    guides(shape="none", color="none", fill="none") + 
+    theme(legend.position="none")
+}
+fig9 <- wrap_plots(psrlistM) + plot_layout(ncol=3, guides="collect") + 
+  plot_annotation(tag_levels="a", tag_suffix=")") 
+ggsave("fig9_pBCM.png", fig9, width=6.5, height=6, dpi=300, bg="white")
+knitr::include_graphics("fig9_pBCM.png")
+```
+
+```{r}
+hr_summerresortF <- hr_summerresort %>% 
+  filter(sex=="F", season==1&!is.na(bcmean)) %>% arrange(-bcmean)
+psrlistF <- lapply(1:nrow(hr_summerresortF), function(i){
+  sra <- hr_summerresortF[i,] %>% 
+    unnest(data) %>% 
+    st_as_sf(coords=c("x_", "y_"), crs=crs_utm18n)
+  this <-  ggplot(sra) +
+    geom_text(aes(x=411000, y=4790200, label= 
+              paste0("ID = ", hr_summerresortF[i,"id"],
+                     ", BC = ", round(hr_summerresortF[i,"bcmean"], 2))),
+              size=2.5, hjust=0) +
+    geom_sf(data=g, fill=NA, color="grey90") +
+    geom_text(aes(x=408000, y=4782000), 
+             label=paste0("2009, n=", sum(year(sra$t_)==2009)),
+             size=2, hjust=0,  parse=FALSE, color="#000004") +
+    geom_text(aes(x=408000, y=4781000), 
+             label=paste0("2010, n=", sum(year(sra$t_)==2010)),
+             size=2, hjust=0,  parse=FALSE, color="#57106e") +
+    geom_text(aes(x=408000, y=4780000), 
+             label=paste0("2011, n=", sum(year(sra$t_)==2011)),
+             size=2, hjust=0,  parse=FALSE, color="#f98e09") +
+    geom_sf(data=olb, fill=NA, color="grey50") +
+    geom_sf(aes(color=factor(year(t_))), shape=3, size=3, alpha=1) + 
+    scale_color_years(name="Year") +
+    coord_sf(xlim=st_bbox(g)[c(1,3)], ylim=st_bbox(g)[c(2,4)]) +
+    theme_void() + 
+    theme(plot.margin=unit(c(0,0,0,0), "cm"),
+          plot.title=element_text(size=10)) + 
+    theme(legend.position="none")
+  return(this)
+})
+for (x in 1:(length(psrlistF)-1)){
+psrlistF[[x]] <- psrlistF[[x]] + 
+    guides(shape="none", color="none", fill="none") + 
+    theme(legend.position="none")
+}
+fig10 <- wrap_plots(psrlistF) + plot_layout(ncol=3, guides="collect") + 
+  plot_annotation(tag_levels="a", tag_suffix=")") 
+ggsave("fig10_BCF.png", fig10, width=6.5, height=6, dpi=300, bg="white")
+knitr::include_graphics("fig10_BCF.png")
+```
+
+```{r}
+fig8 <- hr_summerresort %>% filter(season==1&!is.na(bcmean)) %>% 
+  ggplot(aes(x=sex, y=bcmean)) + 
+  geom_point(aes(fill=sex), size=3, shape=21, color="grey20",
+             position=position_jitter(width=0.2)) + 
+  geom_boxplot(outlier.color=NA, fill=NA, color="grey20") +
+  scale_fill_grey(name="Sex") +
+  ylab("Bhattacharyya's coeffcient (BC)") + xlab("") +
+  ylim(0,1) +
+  theme_classic()
+ggsave("fig8_pba_overlap.png", fig8, width=3, height=3, dpi=300, bg="white")
+knitr::include_graphics("fig8_pba_overlap.png")
+```
+ 
+```{r}
+hr_summerresort %>% filter(season==1&!is.na(bcmean)) %>%
+  group_by(sex) %>% 
+  summarize(n=n(), mean=mean(bcmean), sd=sd(bcmean), 
+            q25=quantile(bcmean, probs=c(0.25)), 
+            q75=quantile(bcmean, probs=c(0.75)), 
+            median=median(bcmean), min=min(bcmean), max=max(bcmean), )
+```
+
+```{r elapsed-time}
+Sys.time()-t0
+```
+
+```{r sessionInfo}
+testjags()
+sessionInfo()
+```
