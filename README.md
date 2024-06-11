@@ -30,7 +30,7 @@ Output
 1) run `bowfin_v3.3_01.Rmd`
 	- This script creates the data object, `mcp_out.RData`, needed to run the next script
 	- The `MCPresultstab_20240303.xlsx` summarizes results from `bowfin_v3.3_01.Rmd`
-2) run `bowfin_v3.3_02.Rmd`
+2) run `bowfin_v3.4_02.Rmd`
    	- This script organizes data and runs stats, outputting results presented in the manuscript
 	- This script generates high resolution figures in PNG format for the manuscript
 4) enjoy
