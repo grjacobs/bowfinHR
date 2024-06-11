@@ -2,7 +2,7 @@
 
 Data, analysis code, and results for the manuscript: 
 
-Jackson, JR, GR Jacobs, AW Latzka, T Landsman, SD Krueger, BP Young, and AR McCune. Bowfin (_Amia ocellicauda_) home ranges and seasonal movements in Oneida Lake, New York. 
+Jackson, JR, GR Jacobs, AW Latzka, T Landsman, SD Krueger, BP Young, and AR McCune. Spawning migration, sex-specific home ranges, and seasonal site fidelity in a lacustrine population of Bowfin (_Amia ocellicauda_)
 
 ## Folder contents
 
